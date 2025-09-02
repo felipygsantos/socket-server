@@ -62,29 +62,35 @@ io.on('connection', (socket) => {
 
   // passageiro cria corrida → notifica motoristas
   // payload: { rideId, passengerId, passengerName, pickupAddress, pickupLocation, destinationAddress, destinationLocation, fare }
-  socket.on('nova_corrida', (data = {}) => {
-    try {
-      if (!data.rideId) return;
-      log('🆕 nova_corrida:', data.rideId, 'passageiro:', data.passengerId);
+  // Passageiro criou corrida -> avisa motoristas
+// payload: { rideId, passengerId, passengerName, pickupAddress, pickupLocation, destinationAddress, destinationLocation, fare, routePolyline? }
+socket.on('nova_corrida', (data = {}) => {
+  try {
+    if (!data.rideId) return;
+    log('🆕 NOVA CORRIDA:', data.rideId, 'de', data.passengerId);
 
-      socket.join(toRide(data.rideId));
+    // sala específica da corrida
+    socket.join(toRide(data.rideId));
 
-      io.to('motoristas').emit('corrida_disponivel', {
-        rideId: data.rideId,
-        passengerId: data.passengerId,
-        passengerName: data.passengerName || 'Passageiro',
-        pickupAddress: data.pickupAddress,
-        pickupLocation: data.pickupLocation,
-        destinationAddress: data.destinationAddress,
-        destinationLocation: data.destinationLocation,
-        fare: data.fare,
-        timestamp: new Date().toISOString(),
-        status: 'pending'
-      });
-    } catch (e) {
-      log('nova_corrida erro:', e);
-    }
-  });
+    // broadcast p/ motoristas (agora inclui routePolyline)
+    io.to('motoristas').emit('corrida_disponivel', {
+      rideId: data.rideId,
+      passengerId: data.passengerId,
+      passengerName: data.passengerName || 'Passageiro',
+      pickupAddress: data.pickupAddress,
+      pickupLocation: data.pickupLocation,
+      destinationAddress: data.destinationAddress,
+      destinationLocation: data.destinationLocation,
+      routePolyline: data.routePolyline || null, // ✅ AGORA VAI
+      fare: data.fare,
+      timestamp: new Date().toISOString(),
+      status: 'pending'
+    });
+  } catch (e) {
+    log('nova_corrida erro:', e);
+  }
+});
+
 
   // motorista aceita → avisa sala da corrida (passageiro + motorista)
   // payload: { rideId, driverId, driverName }
