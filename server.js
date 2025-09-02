@@ -1,4 +1,4 @@
-// server.js (CommonJS) — matching em lote com "Quick Test Mode" p/ dev
+// server.js (CommonJS) — matching em lote com "Quick Test Mode" + ride_subscribe
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -34,57 +34,43 @@ function distKm(a, b) {
 function uid() { return Math.random().toString(36).slice(2, 10); }
 
 // ---------- parâmetros de matching ----------
-const BATCH_SIZE = Number(process.env.BATCH_SIZE || 5);           // lote maior p/ testar
+const BATCH_SIZE = Number(process.env.BATCH_SIZE || 5);
 const OFFER_TTL_MS = Number(process.env.OFFER_TTL_MS || 12000);
 const MAX_ROUNDS = Number(process.env.MAX_ROUNDS || 3);
 const DRIVER_STALE_MS = Number(process.env.DRIVER_STALE_MS || 30000);
 
-// 🚀 QUICK TEST MODE: envia para QUALQUER motorista conectado (ignora localização/available)
+// 🚀 QUICK TEST MODE (para dev): ignora filtros de distância/heartbeat
 const QUICK_TEST_MODE = process.env.QUICK_TEST_MODE === '1';
 
 // ---------- memória ----------
-/**
- * driversBySocket: socketId -> {
- *   driverId, available: bool, last: { lat, lng, at }
- * }
- */
 const driversBySocket = new Map();
-
 /**
- * rides: rideId -> {...}
+ * rides: rideId -> {
+ *   status, passengerSid, pickup, dest, routePolyline, fare,
+ *   offered(Map), offeredSockets(Set), winnerSid, round, timer
+ * }
  */
 const rides = new Map();
 
 // ---------- núcleo de matching ----------
 function listCandidateDrivers(pickup) {
   const out = [];
-
   for (const [sid, info] of driversBySocket.entries()) {
-    // Se Quick Test Mode: pega todo mundo que se identificou como motorista (mesmo offline/sem ping)
     if (QUICK_TEST_MODE) {
       out.push({ socketId: sid, info, d: 0 });
       continue;
     }
-
-    // Modo normal: só disponíveis + com localização recente
     if (!info.available) continue;
     const hasFresh = info.last && (now() - info.last.at) <= DRIVER_STALE_MS;
-    if (hasFresh) {
-      out.push({ socketId: sid, info, d: distKm(info.last, pickup) });
-    }
+    if (hasFresh) out.push({ socketId: sid, info, d: distKm(info.last, pickup) });
   }
-
-  // Ordena por distância quando houver
   out.sort((a, b) => a.d - b.d);
-
-  // Fallback extra: se no modo normal não achou ninguém "fresh", tenta todos disponíveis mesmo sem ping
   if (!QUICK_TEST_MODE && out.length === 0) {
     for (const [sid, info] of driversBySocket.entries()) {
       if (!info.available) continue;
       out.push({ socketId: sid, info, d: 9999 });
     }
   }
-
   return out;
 }
 
@@ -94,13 +80,12 @@ function dispatchRound(rideId) {
 
   const all = listCandidateDrivers(r.pickup);
   const already = r.offeredSockets || new Set();
-  const pool = all.filter(c => !already.has(c.socketId));
+  let candidates = all.filter(c => !already.has(c.socketId)).slice(0, BATCH_SIZE);
 
-  // Em Quick Test, se ainda assim não tem candidatos, tenta ABSOLUTAMENTE todos os motoristas conhecidos
-  let candidates = pool.slice(0, BATCH_SIZE);
   if (QUICK_TEST_MODE && candidates.length === 0) {
     for (const [sid, info] of driversBySocket.entries()) {
-      if (!already.has(sid)) candidates.push({ socketId: sid, info, d: 0 });
+      if (already.has(sid)) continue;
+      candidates.push({ socketId: sid, info, d: 0 });
       if (candidates.length >= BATCH_SIZE) break;
     }
   }
@@ -118,11 +103,7 @@ function dispatchRound(rideId) {
     return;
   }
 
-  log(
-    `📦 round ${r.round + 1}/${MAX_ROUNDS} -> enviando para ${candidates.length} motoristas`,
-    rideId,
-    QUICK_TEST_MODE ? '(QuickTest ON)' : ''
-  );
+  log(`📦 round ${r.round + 1}/${MAX_ROUNDS} -> enviando para ${candidates.length} motoristas`, rideId, QUICK_TEST_MODE ? '(QuickTest ON)' : '');
   const expiresAt = now() + OFFER_TTL_MS;
 
   for (const c of candidates) {
@@ -142,16 +123,13 @@ function dispatchRound(rideId) {
       fare: r.fare,
       expiresAt
     };
-
     io.to(c.socketId).emit('corrida_disponivel', payload);
-
-    // (opcional) Em Quick Test, também pode fazer broadcast para garantir visual em dev:
+    // Se quiser forçar visual em dev:
     // if (QUICK_TEST_MODE) io.to('motoristas').emit('corrida_disponivel', payload);
   }
 
   clearTimer(r);
   r.timer = setTimeout(() => {
-    if (!rides.has(rideId)) return;
     const rr = rides.get(rideId);
     if (!rr || rr.status !== 'searching') return;
     rr.round++;
@@ -189,7 +167,15 @@ io.on('connection', (socket) => {
     } catch (e) { log('identificar erro:', e); }
   });
 
-  // motorista alterna disponibilidade
+  // ✅ (NOVO) cliente garante inscrição na sala da corrida
+  // payload: { rideId }
+  socket.on('ride_subscribe', (data = {}) => {
+    const rideId = String(data.rideId || '');
+    if (!rideId) return;
+    socket.join(toRide(rideId));
+    log('🔔', socket.id, 'subscribed ride', rideId);
+  });
+
   socket.on('driver_status', (data = {}) => {
     const rec = driversBySocket.get(socket.id);
     if (!rec) return;
@@ -234,12 +220,12 @@ io.on('connection', (socket) => {
         pickupAddress: data.pickupAddress || '',
         destinationAddress: data.destinationAddress || '',
         pickup: {
-          lat: Number(data.pickupLocation?.latitude),
-          lng: Number(data.pickupLocation?.longitude),
+          lat: Number(data.pickupLocation?.latitude ?? data.pickupLocation?.lat),
+          lng: Number(data.pickupLocation?.longitude ?? data.pickupLocation?.lng),
         },
         dest: {
-          lat: Number(data.destinationLocation?.latitude),
-          lng: Number(data.destinationLocation?.longitude),
+          lat: Number(data.destinationLocation?.latitude ?? data.destinationLocation?.lat),
+          lng: Number(data.destinationLocation?.longitude ?? data.destinationLocation?.lng),
         },
         routePolyline: data.routePolyline || null,
         fare: data.fare || null,
@@ -251,7 +237,7 @@ io.on('connection', (socket) => {
       };
       rides.set(rideId, r);
 
-      socket.join(toRide(rideId));
+      socket.join(toRide(rideId));          // passageiro entra na sala
       dispatchRound(rideId);
     } catch (e) { log('nova_corrida erro:', e); }
   });
@@ -275,12 +261,13 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // GANHOU
+      // vencedor
       r.status = 'accepted';
       r.winnerSid = socket.id;
       off.status = 'won';
       clearTimer(r);
 
+      // perdedores
       for (const [oid, o] of r.offered.entries()) {
         if (oid === offerId) continue;
         if (o.status === 'pending') {
@@ -304,7 +291,11 @@ io.on('connection', (socket) => {
         approachPolyline: data.approachPolyline || null,
       };
 
+      // ✅ avisa sala da corrida
       io.to(toRide(rideId)).emit('corrida_aceita', payload);
+      // ✅ redundância: também avisa diretamente o socket do passageiro registrado no início
+      if (r.passengerSid) io.to(r.passengerSid).emit('corrida_aceita', payload);
+
       io.to(socket.id).emit('offer_won', { rideId });
     } catch (e) { log('corrida_aceita erro:', e); }
   });
